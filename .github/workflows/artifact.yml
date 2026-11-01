@@ -396,7 +396,7 @@ jobs:
                   elif flag_path.is_file() and expected_path.is_file() and flag_path.read_text().strip() == expected_path.read_text().strip():
                       errors.append("matching flag.txt stored with score 0.0")
               criu = node_dir / "criu"
-              if result.get("error") in ("d8_exited", "percent_builtin", "not_wasm", "serializer_only", "empty_program", "checkpoint_failed"):
+              if result.get("error") in ("d8_exited", "percent_builtin", "not_wasm", "serializer_only", "empty_program", "checkpoint_failed", "connection_error"):
                   if result.get("checkpoint_ok"):
                       errors.append("exited turn is marked checkpoint_ok")
                   if result.get("pages_sha256"):
@@ -500,7 +500,7 @@ jobs:
                   elif nonce != seen_nonce:
                       errors.append(f"{node_dir.name}: nonce is not the same process")
                   result = json.loads((node_dir / "result.json").read_text())
-                  if result.get("error") in ("d8_exited", "percent_builtin", "not_wasm", "serializer_only", "empty_program", "checkpoint_failed"):
+                  if result.get("error") in ("d8_exited", "percent_builtin", "not_wasm", "serializer_only", "empty_program", "checkpoint_failed", "connection_error"):
                       if all((node_dir / name).is_file() for name in FILES):
                           progress = progress_update(running, node_dir, "")
                   elif (node_dir / "criu").is_dir() and list((node_dir / "criu").glob("pages-*.img")):
@@ -1059,6 +1059,8 @@ jobs:
 
 
           def stage_why(stage, err):
+              if err == "connection_error":
+                  return "The API connection failed after retries. No program was sent to d8."
               if err == "checkpoint_failed":
                   return "The dump or restore failed. d8 was stopped and the keeper was kept, so this turn has no page images."
               if err == "d8_exited":
@@ -1205,7 +1207,12 @@ jobs:
 
           def complete(history, seed_ok, cap=None):
               from openai import OpenAI
-              client = OpenAI(api_key=os.environ["AIHUBMIX_API_KEY"], base_url=os.environ["AIHUBMIX_BASE_URL"])
+              import httpx
+              client = OpenAI(
+                  api_key=os.environ["AIHUBMIX_API_KEY"],
+                  base_url=os.environ["AIHUBMIX_BASE_URL"],
+                  timeout=httpx.Timeout(600.0, connect=30.0),
+              )
               left = max(int(os.environ.get("TURNS_LEFT") or "1"), 1)
               spare = 1000000 - TOKENS_USED[0]
               room = spare - 2000 * left
@@ -1239,6 +1246,15 @@ jobs:
                   except Exception as exc:
                       return None, exc
 
+              def transient(exc):
+                  blob = (type(exc).__name__ + " " + str(exc)).lower()
+                  return any(part in blob for part in (
+                      "connection error", "connecterror", "connection reset", "connection aborted",
+                      "server disconnected", "remoteprotocol", "timed out", "timeout",
+                      "readerror", "writeerror", "network", "temporarily unavailable",
+                      "bad gateway", "service unavailable", "gateway timeout",
+                  ))
+
               resp, exc = once(kwargs)
               if exc is not None and ("429" in str(exc) or "quota" in str(exc).lower()):
                   for wait in (30, 60, 120, 180, 300):
@@ -1249,6 +1265,17 @@ jobs:
                           break
                   if exc is not None:
                       raise QuotaStop(str(exc))
+              if exc is not None and transient(exc):
+                  for wait in (15, 30, 60, 120, 180):
+                      log("API connection failed (%s), sleeping %ss" % (exc, wait))
+                      time.sleep(wait)
+                      resp, exc = once(kwargs)
+                      if exc is None:
+                          break
+                      if not transient(exc):
+                          break
+                  if exc is not None and transient(exc):
+                      raise ConnectionStop(str(exc))
               seed_err = None
               if exc is not None and seed_ok and "seed" in str(exc).lower():
                   seed_err = str(exc)
@@ -1391,6 +1418,9 @@ jobs:
           class QuotaStop(Exception):
               pass
 
+          class ConnectionStop(Exception):
+              pass
+
           TOKENS_USED = [0]
 
           LAST_OUTPUT = {"key": "", "count": 0}
@@ -1472,6 +1502,8 @@ jobs:
                   memory_state = "d8_exited"
               elif err == "checkpoint_failed":
                   memory_state = "checkpoint_failed"
+              elif err == "connection_error":
+                  memory_state = "connection_error"
               elif err is None:
                   memory_state = "checkpointed"
               else:
@@ -1707,6 +1739,7 @@ jobs:
               if parent_progress:
                   running.update(parent_progress.encode())
               quota_stop = ""
+              conn_fails = 0
               for index in range(count):
                   turn_no = start_turn + index
                   node = f"{index:03d}"
@@ -1724,6 +1757,7 @@ jobs:
                   try:
                       os.environ["TURNS_LEFT"] = str(count - index)
                       request, response, seed_ok, seed_err = complete(history, seed_ok)
+                      conn_fails = 0
                       if seed_err:
                           log("seed was rejected and omitted: " + seed_err)
                           (Path(os.environ["LOG_ROOT"]) / "seed_rejected.txt").write_text(seed_err)
@@ -1871,6 +1905,34 @@ jobs:
                           log("recorded checkpoint failure at " + node)
                           time.sleep(12)
                           continue
+                  except ConnectionStop as exc:
+                      conn_fails += 1
+                      log("API connection still down (%s/3): %s" % (conn_fails, exc))
+                      rec, raw = read_marker()
+                      if nonce_required and rec["nonce"] != nonce_required:
+                          raise RuntimeError("nonce changed before a connection failure")
+                      reason = "connection_error"
+                      obs = "API connection failed: %s" % exc
+                      score = {"name": "flag", "score": 0.0, "details": {"error": reason}}
+                      harness = [["harness", "rejected", reason]]
+                      stage = 0
+                      info = {"nonce": rec["nonce"], "turn": rec["turn"], "counter": rec["counter"], "pages_sha256": "", "pages": {}}
+                      history.append({"role": "user", "content": "The previous call did not reach the model. Send one complete program."})
+                      write_node(node, request, response, "", obs, history, info, stage, False, reason, score, harness)
+                      written = True
+                      verify.progress_update(running, Path(os.environ["NODES_ROOT"]) / node, "")
+                      summary.append({
+                          "node": node, "stage": stage, "d8_alive": False, "checkpoint_ok": False,
+                          "pages_sha256": "", "nonce": rec["nonce"], "score": 0.0,
+                          "error": reason, "crashed": False,
+                      })
+                      log("recorded connection failure at " + node)
+                      if conn_fails >= 3:
+                          quota_stop = "connection_error"
+                          log("API connection failed 3 turns in a row, keeping %s turns" % len(summary))
+                          break
+                      time.sleep(12)
+                      continue
                   except QuotaStop as exc:
                       quota_stop = str(exc)
                       log("free-model quota closed, keeping %s turns: %s" % (len(summary), quota_stop))
@@ -1933,7 +1995,7 @@ jobs:
               manifest["token_budget"] = 1000000
               manifest.update(extra)
               (out / "MANIFEST.json").write_text(json.dumps(manifest, indent=2, sort_keys=True))
-              if summary and all(item.get("error") in (None, "d8_exited", "percent_builtin", "not_wasm", "serializer_only", "empty_program", "checkpoint_failed") for item in summary):
+              if summary and all(item.get("error") in (None, "d8_exited", "percent_builtin", "not_wasm", "serializer_only", "empty_program", "checkpoint_failed", "connection_error") for item in summary):
                   errors = verify.check_tree(out)
                   if errors:
                       raise RuntimeError("local audit failed\n" + "\n".join(errors))
@@ -1998,14 +2060,19 @@ jobs:
               history, flag = load_prompt()
               count = int(os.environ["MAX_TURNS"])
               summary, best, reached, seed_ok, progress, stopped = run_turns(history, flag, 0, count, None, True)
-              extra = {"stopped_reason": "free_model_quota"} if stopped else {}
+              if stopped == "connection_error":
+                  extra = {"stopped_reason": "connection_error"}
+              elif stopped:
+                  extra = {"stopped_reason": "free_model_quota"}
+              else:
+                  extra = {}
               try:
                   write_manifest(summary, digest, seed_ok, best, reached, progress, extra)
               except Exception as exc:
                   log(str(exc))
                   raise SystemExit(1)
               solved = any(item.get("score") == 1.0 for item in summary)
-              bad = [item for item in summary if item.get("error") not in (None, "d8_exited", "percent_builtin", "not_wasm", "serializer_only", "empty_program", "checkpoint_failed")]
+              bad = [item for item in summary if item.get("error") not in (None, "d8_exited", "percent_builtin", "not_wasm", "serializer_only", "empty_program", "checkpoint_failed", "connection_error")]
               if not summary or bad:
                   raise SystemExit(1)
               if not solved and len(summary) != count and not stopped:
@@ -2091,7 +2158,7 @@ jobs:
                   "what_if": what,
               }
               write_manifest(summary, digest, seed_ok, best, reached, progress, extra)
-              bad = [item for item in summary if item.get("error") not in (None, "checkpoint_failed")]
+              bad = [item for item in summary if item.get("error") not in (None, "checkpoint_failed", "connection_error")]
               if len(summary) != count or bad:
                   raise SystemExit(1)
           
