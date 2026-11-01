@@ -1205,13 +1205,25 @@ jobs:
               return text
 
 
+          def client_timeout():
+              # openai 3.x depends on httpx2, not httpx. Importing httpx
+              # raised ModuleNotFoundError on the first turn and ended the run.
+              for name in ("httpx2", "httpx"):
+                  try:
+                      mod = __import__(name)
+                      return mod.Timeout(600.0, connect=30.0)
+                  except Exception:
+                      continue
+              return 600.0
+
+
           def complete(history, seed_ok, cap=None):
               from openai import OpenAI
-              import httpx
               client = OpenAI(
                   api_key=os.environ["AIHUBMIX_API_KEY"],
                   base_url=os.environ["AIHUBMIX_BASE_URL"],
-                  timeout=httpx.Timeout(600.0, connect=30.0),
+                  timeout=client_timeout(),
+                  max_retries=0,
               )
               left = max(int(os.environ.get("TURNS_LEFT") or "1"), 1)
               spare = 1000000 - TOKENS_USED[0]
@@ -1694,11 +1706,14 @@ jobs:
               log_api(request, response)
               log_commands(harness)
               log("\n".join(lines))
+              detail = (obs or "").strip() or str(err or "")
               notice = "stage %s %s | memory %s | score %s | %s" % (
                   stage, result.get("stage_name"), result.get("memory_state"),
-                  (score or {}).get("score"), (" ".join((obs or "").split())[:120] or "(no output)"),
+                  (score or {}).get("score"), (" ".join(detail.split())[:300] or "(no output)"),
               )
               print("::notice title=Turn %s/%s::%s" % (node, max(total - 1, 0), notice.replace("\n", " ")), flush=True)
+              if err and err not in ("d8_exited", "percent_builtin", "not_wasm", "serializer_only", "empty_program", "checkpoint_failed", "connection_error"):
+                  print("::error title=Turn %s::%s" % (node, " ".join(str(err).split())[:700]), flush=True)
           
           
           def recover_after_checkpoint_failure(node):
